@@ -1,10 +1,10 @@
 # ShoujoKagekiCore 使用说明
 
-本文面向使用 Core 的玩家和 Mod 作者，说明 Core 2.0.1 的能力、配置与 API V1 接入方式。SDK 随完整 Core 构建产物提供。
+本文面向使用 Core 的玩家和 Mod 作者，说明 Core 2.0.2 的能力、配置与 API V1 接入方式。SDK 随完整 Core 构建产物提供。
 
-Core 2.0.1 支持与已启用的 `ShoujoKagekiAijoCore` 1.x 一起安装。兼容入口允许旧引导将启动交给新版，已发布的 V1 角色 DLL 通过类型转发使用同一份 Runtime。首次启动会在新配置缺失时继承旧配置，保留已有对局的 Core 存档字段。新构建的角色使用 `ShoujoKagekiCore.Api.V1.dll`，游戏清单依赖 `ShoujoKagekiCore`。
+Core 2.0.2 的游戏清单只发布 `ShoujoKagekiCore`，显示名为「少女歌剧ShoujoKageki」。Karen 和 Junna 需同步更新到依赖 Core 2.0.2 的版本。首次启动会在新配置缺失时继承旧配置，保留已有对局的 Core 存档字段。
 
-升级时用 2.0.1 替换 2.0.0 过渡包。需要单独运行 1.x 时，将 2.x 整包移出游戏加载目录。
+手动升级时，先把旧 Core 整个目录移出游戏加载路径，再解压 2.0.2。直接覆盖 2.0.1 会留下兼容清单。若安装了内嵌 Core 1.x 的旧版 Karen 工坊包，也需更新该工坊项目或移除旧包。
 
 引导、服务端、存档与发布方面的实现约定见 [Core 实现文档](docs/IMPLEMENTATION.md)。[GitHub 仓库](https://github.com/backinfile/STS2_ShoujoKagekiCore)
 
@@ -129,7 +129,7 @@ Core 使用 Karen 现行发行配置中的接收地址，Web 页面入口由对�
   "affects_gameplay": true,
   "dependencies": [
     { "id": "BaseLib", "min_version": "3.4.8" },
-    { "id": "ShoujoKagekiCore", "min_version": "2.0.0" }
+    { "id": "ShoujoKagekiCore", "min_version": "2.0.2" }
   ]
 }
 ```

@@ -2,7 +2,7 @@
 
 引用发行目录中 core.bundle 的 apiAssembly，关闭引用的复制本地选项。程序集版本固定为 1.0.0.0，命名空间为 ShoujoKageki.Core.V1。
 
-角色清单声明 BaseLib 3.4.8 和 ShoujoKagekiCore 2.0.0 依赖。角色构建完成后调用发行目录的 sdk/pack-character.ps1。
+角色清单声明 BaseLib 3.4.8 和 ShoujoKagekiCore 2.0.2 依赖。角色构建完成后调用发行目录的 sdk/pack-character.ps1。
 
 ```powershell
 & "$CorePackage/sdk/pack-character.ps1" -CorePackage $CorePackage `
