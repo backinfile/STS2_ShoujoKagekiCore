@@ -4,7 +4,7 @@ param(
     [string]$Godot = $env:GODOT_BIN,
     [string]$TelemetryEndpointPath = $env:SHOUJO_TELEMETRY_ENDPOINT_PATH,
     [string]$OutputDirectory = '',
-    [string]$Version = '2.0.2',
+    [string]$Version = '2.0.3',
     [string]$MainGameDir = $env:SHOUJO_MAIN_GAME
 )
 $ErrorActionPreference = 'Stop'
