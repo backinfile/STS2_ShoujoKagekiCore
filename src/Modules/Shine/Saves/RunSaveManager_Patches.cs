@@ -5,7 +5,7 @@ using MegaCrit.Sts2.Core.Saves.Managers;
 using MegaCrit.Sts2.Core.Saves.Runs;
 namespace ShoujoKageki.Core.Runtime.Modules.Shine.Saves;
 
-/// <summary>Read-only adapter for files written before registered Core player saves.</summary>
+/// <summary>Bridges Core player snapshots when the native JSON metadata lacks the BaseLib extension.</summary>
 [HarmonyPatch]
 internal static class RunSaveManager_Patches
 {
@@ -14,6 +14,31 @@ internal static class RunSaveManager_Patches
     {
         if (path.Contains(RunSaveManager.runSaveFileName) || path.Contains(RunSaveManager.multiplayerRunSaveFileName))
             KarenRunSaveReadScope.Record(__result);
+    }
+    [HarmonyPatch(typeof(RunSaveManager), nameof(RunSaveManager.SaveRun), new[] { typeof(SerializableRun), typeof(bool) })]
+    private static class NativeWrite
+    {
+        private static void Prefix(SerializableRun save, bool isMultiplayer, out CoreRunSaveWriteScope __state)
+            => __state = new(save, isMultiplayer);
+
+        private static Exception? Finalizer(Exception? __exception, CoreRunSaveWriteScope? __state)
+        { __state?.Dispose(); return __exception; }
+    }
+    [HarmonyPatch]
+    private static class WriteBytes
+    {
+        private static IEnumerable<MethodBase> TargetMethods()
+        {
+            Type[] parameters = [typeof(string), typeof(byte[])];
+            foreach (var store in new[] { typeof(GodotFileIo), typeof(CloudSaveStore) })
+            {
+                yield return AccessTools.Method(store, nameof(GodotFileIo.WriteFile), parameters);
+                yield return AccessTools.Method(store, nameof(GodotFileIo.WriteFileAsync), parameters);
+            }
+        }
+
+        private static void Prefix(string path, ref byte[] bytes)
+            => bytes = CoreRunSaveWriteScope.IncludeSnapshots(path, bytes);
     }
     [HarmonyPatch]
     private static class NativeRead

@@ -1,7 +1,9 @@
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using BaseLib.Patches.Saves;
 using BaseLib.Utils;
+using HarmonyLib;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.DevConsole;
 using MegaCrit.Sts2.Core.DevConsole.ConsoleCommands;
@@ -26,6 +28,15 @@ public static class Startup
     public static void Initialize()
     {
         _ = Growth;
+        if (Environment.GetEnvironmentVariable("CORE_SL_WITHOUT_PLAYER_SAVE_METADATA") == "1")
+        {
+            var serializerContext = typeof(JsonSerializationUtility).Assembly.GetType("MegaCrit.Sts2.Core.Saves.MegaCritSerializerContext", throwOnError: true)!;
+            var initializer = AccessTools.DeclaredMethod(serializerContext, "SerializablePlayerPropInit");
+            var patch = Harmony.GetPatchInfo(initializer)?.Postfixes.Single(
+                item => item.PatchMethod.DeclaringType?.DeclaringType == typeof(ExtendedSavePatches))
+                ?? throw new InvalidOperationException("BaseLib's player JSON metadata patch was not installed.");
+            new Harmony("CorePersistenceProbe").Unpatch(initializer, patch.PatchMethod);
+        }
         ((Godot.SceneTree)Godot.Engine.GetMainLoop()).ProcessFrame += () => Godot.RenderingServer.ForceDraw(false);
     }
 }

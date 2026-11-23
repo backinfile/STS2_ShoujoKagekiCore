@@ -21,6 +21,7 @@ parser.add_argument('--core', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--probe', type=Path, required=True)
 parser.add_argument('--roundtrip-only', action='store_true')
+parser.add_argument('--without-player-save-metadata', action='store_true')
 parser.add_argument('--save-format', choices=['current', 'legacy-core', 'legacy-karen', 'mixed', 'empty-archive'], default='current')
 parser.add_argument('--cycles', type=int, choices=range(1, 4), default=2)
 args = parser.parse_args()
@@ -105,7 +106,8 @@ def start():
           silent_test=True, skip_tutorial=True, skip_first_prompt=True, window_width=1280, window_height=720))
     env = os.environ.copy()
     env.update(APPDATA=str(user / 'AppData/Roaming'), LOCALAPPDATA=str(user / 'AppData/Local'),
-               CORE_SL_EXPECTED=str(root / 'expected.json'))
+               CORE_SL_EXPECTED=str(root / 'expected.json'),
+               CORE_SL_WITHOUT_PLAYER_SAVE_METADATA='1' if args.without_player_save_metadata else '0')
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0
@@ -223,7 +225,8 @@ try:
     wait(lambda s: s.get('battle', {}).get('is_play_phase'), 'combat fixture')
     screenshot('before-seed')
     check('seed')
-    check('roundtrip')
+    if not args.without_player_save_metadata:
+        check('roundtrip')
     check('view')
     screenshot('archive')
     command('core_sl close-view')
@@ -258,11 +261,12 @@ try:
             action('menu_select', option='continue')
             wait(lambda s: s.get('player') is not None and s.get('battle', {}).get('is_play_phase'), 'continued run')
             check('verify')
-            check('roundtrip')
+            if not args.without_player_save_metadata:
+                check('roundtrip')
             check('view')
             screenshot('archive')
             command('core_sl close-view')
-    write(root / 'result.json', dict(passed=True, cycles=0 if args.roundtrip_only else args.cycles, save_format=args.save_format))
+    write(root / 'result.json', dict(passed=True, cycles=0 if args.roundtrip_only else args.cycles, save_format=args.save_format, without_player_save_metadata=args.without_player_save_metadata))
 except Exception as error:
     write(root / 'result.json', dict(passed=False, phase=phase, error=str(error)))
     raise

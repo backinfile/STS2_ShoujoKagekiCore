@@ -40,18 +40,18 @@ internal sealed class KarenRunSaveReadScope : IDisposable
 
         foreach (var player in result.SaveData.Players)
         {
-            JsonElement extra = default;
+            JsonElement rawPlayer = default;
             foreach (var raw in players.EnumerateArray())
             {
                 if (raw.TryGetProperty("net_id", out var id) && id.TryGetUInt64(out var netId)
                     && netId == player.NetId)
                 {
-                    raw.TryGetProperty("extra_fields", out extra);
+                    rawPlayer = raw;
                     break;
                 }
             }
 
-            CorePlayerSave.BindLegacy(player, extra);
+            CorePlayerSave.BindDiskSnapshot(player, rawPlayer);
         }
     }
 

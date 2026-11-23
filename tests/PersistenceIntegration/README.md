@@ -43,6 +43,10 @@ python tests/PersistenceIntegration/run.py --game $GameDir --core $CorePackage `
 
 前三种旧格式样本也包含无关旧字段，保存原始转换文件供迁移检查。`--roundtrip-only` 只运行同进程 JSON 与界面检查。`--mod <角色模组目录>` 可重复传入，配合 `--character <模型 ID>` 选择角色，默认铁甲战士。
 
+## 玩家 JSON 扩展注册失败
+
+传入 `--without-player-save-metadata` 可复现 BaseLib 未能为玩家 JSON 注册扩展属性时的状态。探针在序列化元数据初始化前移除该扩展，随后走游戏的实际存盘和重启入口。使用 `--save-format current` 验证后备写入及读回，也可用旧字段格式对照恢复。此模式跳过直接调用 JSON 序列化 API 的进程内往返。
+
 ## 证据
 
 输出包括预期快照、每轮落盘存档、每项 JSON 断言结果、移牌前截图、耗尽牌堆截图、游戏日志、游戏与 Core 版本、实际 DLL/PCK 哈希及窗口保护记录。存档和日志都位于忽略的输出目录。

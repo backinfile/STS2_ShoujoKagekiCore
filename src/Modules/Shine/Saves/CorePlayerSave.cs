@@ -26,9 +26,9 @@ public sealed class CorePlayerSave : ICoreModule, IPlayerStateEvents
             => JsonSerializer.Serialize(writer, card, JsonSerializationUtility.GetTypeInfo<SerializableCard>());
     }
     private static readonly JsonSerializerOptions Options = new() { Converters = { new CardConverter() } };
-    private const string SaveId = "ShoujoKagekiAijoCore.player-state@1";
+    internal const string SaveId = "ShoujoKagekiAijoCore.player-state@1";
     private sealed record Snapshot(int Format, List<SerializableCard> Cards, CoreRunRules Rules);
-    private static readonly ConditionalWeakTable<SerializablePlayer, Snapshot> Legacy = new();
+    private static readonly ConditionalWeakTable<SerializablePlayer, Snapshot> DiskFallback = new();
     private static readonly ConditionalWeakTable<Player, object> Applied = new();
     private static CorePlayerSave _instance = null!;
     public event Action<Player>? Restored;
@@ -78,9 +78,28 @@ public sealed class CorePlayerSave : ICoreModule, IPlayerStateEvents
         ShineArchive.SetRules(player, state.Rules);
         ShineArchive.Restore(player, state.Cards);
     }
-    internal static void BindLegacy(SerializablePlayer player, JsonElement extra)
+    internal const string SaveDictionary = "save_dict_String";
+
+    internal static string? GetSerializedSnapshot(SerializablePlayer player)
+        => ExtendedSaveHandlers<Player, SerializablePlayer>.ExtendedData[player].DictForType<string>().GetValueOrDefault(SaveId);
+
+    internal static void BindDiskSnapshot(SerializablePlayer player, JsonElement rawPlayer)
     {
-        if (ExtendedSaveHandlers<Player, SerializablePlayer>.ExtendedData[player].DictForType<string>().ContainsKey(SaveId)) return;
+        var values = ExtendedSaveHandlers<Player, SerializablePlayer>.ExtendedData[player].DictForType<string>();
+        if (values.ContainsKey(SaveId)) return;
+        JsonElement extra = default;
+        if (rawPlayer.ValueKind == JsonValueKind.Object)
+        {
+            if (rawPlayer.TryGetProperty(SaveDictionary, out var saves) && saves.ValueKind == JsonValueKind.Object
+                && saves.TryGetProperty(SaveId, out var snapshot) && snapshot.ValueKind == JsonValueKind.String)
+            {
+                var json = snapshot.GetString()!;
+                DiskFallback.AddOrUpdate(player, Decode(json));
+                values[SaveId] = json;
+                return;
+            }
+            rawPlayer.TryGetProperty("extra_fields", out extra);
+        }
         bool hasLegacy = extra.ValueKind == JsonValueKind.Object && extra.TryGetProperty("karen_player_disposed_pile", out _);
         var cards = new List<SerializableCard>();
         CoreRunRules rules = new(hasLegacy ? ShineArchive.LegacyRulesetId : V1.Shine.RulesetId,
@@ -94,17 +113,17 @@ public sealed class CorePlayerSave : ICoreModule, IPlayerStateEvents
         }
         ValidateRules(rules);
         var migrated = new Snapshot(1, cards, rules with { NetworkFingerprint = RuntimeEntry.Fingerprint });
-        Legacy.AddOrUpdate(player, migrated);
+        DiskFallback.AddOrUpdate(player, migrated);
         // Canonicalized saves can be sent directly, before constructing a Player.
-        ExtendedSaveHandlers<Player, SerializablePlayer>.ExtendedData[player].DictForType<string>()[SaveId] = JsonSerializer.Serialize(migrated, Options);
+        values[SaveId] = JsonSerializer.Serialize(migrated, Options);
     }
     [HarmonyPatch(typeof(Player), nameof(Player.FromSerializable))]
-    private static class LegacyRestore
+    private static class RestoreDiskFallback
     {
         [HarmonyPostfix, HarmonyPriority(Priority.Last)]
         private static void Postfix(SerializablePlayer save, Player __result)
         {
-            if (!Applied.TryGetValue(__result, out _) && Legacy.TryGetValue(save, out var old)) Apply(__result, old);
+            if (!Applied.TryGetValue(__result, out _) && DiskFallback.TryGetValue(save, out var snapshot)) Apply(__result, snapshot);
             _instance.Restored?.Invoke(__result);
         }
     }
@@ -116,7 +135,7 @@ public sealed class CorePlayerSave : ICoreModule, IPlayerStateEvents
         {
             Applied.Remove(__instance);
             ExtendedSaveHandlers<Player, SerializablePlayer>.Load(player, __instance);
-            if (!Applied.TryGetValue(__instance, out _) && Legacy.TryGetValue(player, out var old)) Apply(__instance, old);
+            if (!Applied.TryGetValue(__instance, out _) && DiskFallback.TryGetValue(player, out var snapshot)) Apply(__instance, snapshot);
             _instance.Restored?.Invoke(__instance);
         }
     }
