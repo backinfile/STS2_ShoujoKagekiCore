@@ -122,6 +122,11 @@
 - 使用生成图片时，交付前按角色项目约定运行本地 Artifact Cleaner，保留原图并记录参数与成品路径。
 - 测试记录写明所用版本、最终包哈希、实际通过项、失败项与待验事项。
 
+## 玩家报错例行巡检
+
+- 开始前阅读 [巡检规则](docs/error-watch/README.md)，按配置检查 Karen、Core、Junna 和官方游戏公告。
+- 按用户安排，例行巡检直接维护 `docs/待修复问题.md` 与已忽略的 `artifacts/error-watch/`；源码修复等后续工作另行安排。
+
 ## Git 与隐私
 
 - 修改任务使用 `$worktree-task`，工作树位于 `../worktrees/STS2_ShoujoKagekiCore/<task-slug>`，保留原检出与原有未提交状态。
