@@ -19,7 +19,10 @@ internal static class RunSaveManager_Patches
     private static class NativeWrite
     {
         private static void Prefix(SerializableRun save, bool isMultiplayer, out CoreRunSaveWriteScope __state)
-            => __state = new(save, isMultiplayer);
+        {
+            __state = new(save, isMultiplayer);
+            ShineService.ObserveRunCheckpoint(save);
+        }
 
         private static Exception? Finalizer(Exception? __exception, CoreRunSaveWriteScope? __state)
         { __state?.Dispose(); return __exception; }

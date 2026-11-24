@@ -124,6 +124,7 @@ public sealed class CorePlayerSave : ICoreModule, IPlayerStateEvents
         private static void Postfix(SerializablePlayer save, Player __result)
         {
             if (!Applied.TryGetValue(__result, out _) && DiskFallback.TryGetValue(save, out var snapshot)) Apply(__result, snapshot);
+            ShineService.ObserveRestoredDeck(__result, save, "load");
             _instance.Restored?.Invoke(__result);
         }
     }
@@ -136,6 +137,7 @@ public sealed class CorePlayerSave : ICoreModule, IPlayerStateEvents
             Applied.Remove(__instance);
             ExtendedSaveHandlers<Player, SerializablePlayer>.Load(player, __instance);
             if (!Applied.TryGetValue(__instance, out _) && DiskFallback.TryGetValue(player, out var snapshot)) Apply(__instance, snapshot);
+            ShineService.ObserveRestoredDeck(__instance, player, "sync");
             _instance.Restored?.Invoke(__instance);
         }
     }

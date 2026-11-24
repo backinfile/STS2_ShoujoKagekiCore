@@ -30,6 +30,7 @@ public static class ShineArchive
     public static CoreRunRules GetRules(Player player) => For(player).Rules;
     public static void SetRules(Player player, CoreRunRules rules) => For(player).Rules = rules;
     internal static int Count(Player player) => For(player).Cards.Count;
+    internal static int? KnownCount(Player player) => Data.TryGetValue(player, out var archive) ? archive.Cards.Count : null;
     public static IReadOnlyList<SerializableCard> Snapshots(Player player) => Array.AsReadOnly(For(player).Cards.ToArray());
     public static IReadOnlyList<CardModel> Models(Player player) => Snapshots(player).Select(save => ArchivedModel(player, save)).ToArray();
     private static CardModel ArchivedModel(Player player, SerializableCard save)

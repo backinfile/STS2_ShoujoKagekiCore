@@ -15,7 +15,7 @@ using ShoujoKageki.Core.V1;
 
 namespace ShoujoKageki.Core.Runtime.Modules.Shine;
 
-public sealed class ShineService : IShineService, ICoreModule
+public sealed partial class ShineService : IShineService, ICoreModule
 {
     public static ShineService Instance { get; private set; } = null!;
     public string Id => "shine";
@@ -76,6 +76,8 @@ public sealed class ShineService : IShineService, ICoreModule
         Temporary.Set(card, temporary);
         if (temporary) PermanentOrigins.Remove(card);
         if (remaining > 0) { Pending.Set(card, false); Depleted.Set(card, false); }
+        if (remaining == 0) RememberDeckWrite(card, "set-state");
+        else ForgetDeckWrite(card);
     }
     public void ChangeMaximum(CardModel card, int amount)
     {
@@ -149,8 +151,15 @@ public sealed class ShineService : IShineService, ICoreModule
             foreach (var card in Executed)
             {
                 if (!Pending.Get(card) && Instance.GetState(card) is not { Remaining: <= 0 }) continue;
+                var permanent = card.DeckVersion ?? card;
+                Exception? failure = null;
                 try { await Instance.FinishDepletion(card, Choice); }
-                catch (Exception error) { (errors ??= []).Add(error); }
+                catch (Exception error)
+                {
+                    failure = error;
+                    (errors ??= []).Add(error);
+                }
+                ReportRetainedDeckCard(permanent, DeckObservation.Cleanup, "batch-flush", card, failure);
             }
             if (errors != null) throw new AggregateException("Card depletion cleanup failed.", errors);
         }
@@ -185,11 +194,19 @@ public sealed class ShineService : IShineService, ICoreModule
             {
                 var remaining = Math.Max(0, state.Remaining - 1);
                 Remaining.Set(card, remaining);
-                if (remaining == 0) Pending.Set(card, true);
+                if (remaining == 0)
+                {
+                    Pending.Set(card, true);
+                    if (state.Remaining != 0) RememberDeckWrite(card, "debit", kind, state.Remaining);
+                }
                 if (!state.Temporary && card.DeckVersion is { } permanent && !ReferenceEquals(permanent, card))
                 {
                     _ = GetState(permanent);
-                    Remaining.Set(permanent, Math.Min(Math.Max(0, Remaining.Get(permanent)), remaining));
+                    int before = Remaining.Get(permanent);
+                    int updated = Math.Min(Math.Max(0, before), remaining);
+                    Remaining.Set(permanent, updated);
+                    if (updated == 0 && before != 0)
+                        RememberDeckWrite(permanent, "combat-debit", kind, before, card, state.Remaining);
                 }
             }
         }
@@ -243,6 +260,7 @@ public sealed class ShineService : IShineService, ICoreModule
     }
     internal void ResetLifecycle(CardModel card)
     {
+        ForgetDeckWrite(card);
         ArchivedModels.Remove(card);
         PermanentOrigins.GetOrCreateValue(card);
         Depleted.Set(card, false);
@@ -272,15 +290,16 @@ public sealed class ShineService : IShineService, ICoreModule
         if (GetState(source) is { Temporary: false }) PermanentOrigins.GetOrCreateValue(snapshot);
     }
     internal bool IsDepletedCopySource(CardModel card) => Depleted.Get(card) || GetState(card) is { Remaining: <= 0 };
-    internal CardModel CreateEmptyShell(CardModel source) => EmptyShellFor(source);
+    internal CardModel CreateEmptyShell(CardModel source) => EmptyShellFor(source, "explicit-copy");
     internal void InitializeCopy(CardModel source, CardModel copy, CardCopyPurpose purpose)
     {
         if (purpose == CardCopyPurpose.Reacquire) ResetLifecycle(copy);
         else if (GetState(source) is { } state)
             SetState(copy, state.Remaining, state.Maximum, purpose == CardCopyPurpose.TemporaryCopy || state.Temporary);
     }
-    private static CardModel EmptyShellFor(CardModel source)
+    private static CardModel EmptyShellFor(CardModel source, string path)
     {
+        ReportRetainedDeckCard(source, DeckObservation.Copy, path);
         var shell = (CardModel)ModelDb.Card<CoreEmptyShell>().MutableClone();
         shell.Owner = source.Owner;
         return shell;
@@ -377,7 +396,10 @@ public sealed class ShineService : IShineService, ICoreModule
         {
             // Native theft returns DeckVersion; retain the budget of the card actually stolen.
             if (card.DeckVersion is { } permanent && Instance.GetState(card) is { Temporary: false } state)
+            {
                 Instance.SetState(permanent, state.Remaining, state.Maximum);
+                if (state.Remaining == 0) RememberDeckWrite(permanent, "theft", combat: card);
+            }
         }
     }
 
@@ -387,7 +409,11 @@ public sealed class ShineService : IShineService, ICoreModule
         private static void Postfix(AbstractModel __instance, ref AbstractModel __result)
         {
             if (__instance is not CardModel source || __result is not CardModel copy || Instance.GetState(source) is not { } state) return;
-            if (source.IsMutable && (Depleted.Get(source) || state.Remaining <= 0) && SnapshotCopyDepth.Value == 0) { __result = EmptyShellFor(source); return; }
+            if (source.IsMutable && (Depleted.Get(source) || state.Remaining <= 0) && SnapshotCopyDepth.Value == 0)
+            {
+                __result = EmptyShellFor(source, "native-clone");
+                return;
+            }
             Instance.SetState(copy, state.Remaining, state.Maximum, state.Temporary);
             Depleted.Set(copy, Depleted.Get(source));
             Pending.Set(copy, Pending.Get(source));
