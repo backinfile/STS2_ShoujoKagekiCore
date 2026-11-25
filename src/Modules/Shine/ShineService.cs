@@ -469,7 +469,8 @@ public sealed partial class ShineService : IShineService, ICoreModule
     {
         private static void Postfix(CardModel __instance)
         {
-            if (_cardReadDepth == 0) Instance.RestoreToMaximum(__instance);
+            // Upgrades during a resolution must preserve the depletion already queued for that play.
+            if (_cardReadDepth == 0 && !Pending.Get(__instance)) Instance.RestoreToMaximum(__instance);
         }
     }
     [HarmonyPatch]

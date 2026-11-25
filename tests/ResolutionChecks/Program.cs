@@ -367,6 +367,16 @@ if (args.Contains("--save-only"))
         if (service.GetState(restored) is not { Remaining: 6 })
             throw new InvalidOperationException("A real upgrade must still refill Shine.");
     }
+    var lastUse = ModelDb.Card<ResolutionCard>().ToMutable();
+    service.SetState(lastUse, 1, 6);
+    await service.ResolveAsync(lastUse, () =>
+    {
+        lastUse.UpgradeInternal();
+        if (lastUse.CurrentUpgradeLevel != 1 || service.GetState(lastUse) is not { Remaining: 0, PendingDepletion: true })
+            throw new InvalidOperationException("An upgrade during the last use must preserve pending Shine depletion.");
+        return Task.CompletedTask;
+    }, CardResolutionKind.NativePlay);
+
     var legacySave = new MegaCrit.Sts2.Core.Saves.Runs.SerializableCard
     {
         Id = ModelDb.GetId<ResolutionCard>(), CurrentUpgradeLevel = 1,
