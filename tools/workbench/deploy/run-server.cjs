@@ -6,7 +6,7 @@ const backend=JSON.parse(fs.readFileSync(config.backendConfig,'utf8'));
 const registry=require('./workspace-registry.cjs').createRegistry({stateDirectory:config.stateDirectory||path.dirname(config.backendConfig),assetDirectory:path.join(config.webDirectory||'/var/www/junna','assets')});
 const {server}=require('./mcp-daemon.cjs').createDaemon({registry,token:backend.token,port:backend.port,pageFile:path.join(__dirname,'editor.html')});
 server.listen(backend.port,'127.0.0.1',()=>console.log('Shoujo workbench MCP ready'));
-const relay=require('./relay.cjs');
+const relay=require('./relay.cjs').start(config);
 let publisher,stopping=false;
 function startPublisher(){publisher=fork(path.join(__dirname,'publish-readonly.cjs'),[],{stdio:'inherit',windowsHide:true});publisher.on('exit',()=>{if(!stopping)setTimeout(startPublisher,1000);});}
 startPublisher();

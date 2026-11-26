@@ -25,7 +25,11 @@ Karen、Core、Junna 均为自有 Mod。Core 当前 ID 为 `ShoujoKagekiCore`，
 
 ## 完整采集与增量比较
 
-使用配置中的 `errors_api_base` 只读 API，获取全部分页。`build`、`mod_version`、`platform`、`source`、`core_version`、`game_target`、`source_mod` 均为 `all`。不能只筛选安装了本系列 Mod 的记录。
+使用只读采集器生成本轮证据文件。采集器先尝试轻量清单快照，逐页读取，按指纹补抓新增或变化的详情。旧服务沿用全量列表，单并发采集并遵守 `Retry-After`。成功基线由巡检分析完成后更新。
+
+```powershell
+python tools/telemetry/read_error_inventory.py --config artifacts/error-watch/config.json --baseline artifacts/error-watch/state.json --output artifacts/error-watch/<本轮目录>/collection.json
+```
 
 以指纹、累计次数、会话数、首次／最近时间和版本判断新增或变化，为相关条目读取完整详情、调用栈和启用 Mod 清单。Core、Junna 版本从 `core_telemetry` 与新旧 ID 的 `mods` 清单读取；旧协议 `mod_version` 仅用于 Karen。缺少版本记为未知。
 

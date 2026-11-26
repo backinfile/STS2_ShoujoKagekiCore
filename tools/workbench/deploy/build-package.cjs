@@ -6,7 +6,7 @@ const config=JSON.parse(fs.readFileSync(configFile,'utf8').replace(/^\uFEFF/,'')
 if(new URL(config.origin).protocol!=='https:'||!/^[a-f0-9]{64}$/.test(config.secret)||!/^\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+$/.test(config.prefix))throw Error('Cloud connection configuration is invalid');
 fs.mkdirSync(out,{recursive:true});
 for(const name of ['filter-state.js','mcp-daemon.cjs','mcp-config.cjs','mcp-store.cjs','mcp-sqlite.cjs','mcp-tools.cjs','mods.cjs','native-store.cjs','native-game.json','workspace-registry.cjs','workbench-domain.js','fit-pool-view.js','seed.json','package.json','package-lock.json'])fs.copyFileSync(path.join(source,name),path.join(out,name));
-for(const name of ['relay.cjs','run-server.cjs','publish-readonly.cjs','static-runtime.cjs'])fs.writeFileSync(path.join(out,name),fs.readFileSync(path.join(__dirname,name),'utf8').replaceAll("require('../","require('./"));
+for(const name of ['relay.cjs','run-server.cjs','publish-readonly.cjs','backup.cjs','static-runtime.cjs'])fs.writeFileSync(path.join(out,name),fs.readFileSync(path.join(__dirname,name),'utf8').replaceAll("require('../","require('./"));
 for(const mod of require('../mods.cjs').mods){
   const relative=mod.id==='junna'?'':path.join('mods',mod.id),pub=path.join(out,'public',relative),editor=path.join(out,relative);
   if(mod.readOnly){

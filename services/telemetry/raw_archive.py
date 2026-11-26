@@ -8,9 +8,14 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import tarfile
 import tempfile
 import uuid
+
+
+class CapacityError(OSError):
+    pass
 
 
 def utc_day(timestamp):
@@ -45,7 +50,21 @@ class RawArchive:
     def loose_path(self, row):
         return self.root / "pending" / utc_day(row["received"]) / (row["sha256"] + ".json")
 
-    def write(self, digest, received, body):
+    def files(self):
+        yield from self.root.glob("pending/*/*")
+        yield from self.root.glob("bundles/*")
+
+    def disk_bytes(self):
+        total = 0
+        for path in self.files():
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                # The archiver may have just replaced or removed this path.
+                continue
+        return total
+
+    def write(self, digest, received, body, *, limit):
         row = {"sha256": digest, "received": received}
         target = self.loose_path(row)
         self.ensure_directory(target.parent)
@@ -53,6 +72,8 @@ class RawArchive:
             if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                 raise OSError("raw_submission_checksum_mismatch")
             return
+        if self.disk_bytes() + len(body) > limit or shutil.disk_usage(self.root).free < len(body):
+            raise CapacityError("raw_submission_capacity_reached")
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
@@ -76,6 +97,36 @@ class RawArchive:
         if len(body) != row["bytes"] or hashlib.sha256(body).hexdigest() != row["sha256"]:
             raise OSError("raw_submission_checksum_mismatch")
         return body
+
+    def referenced_file(self, row):
+        return self.root / row["archive"] if row["archive"] else self.loose_path(row)
+
+    def archive_locations(self, missing):
+        """Find and verify archived members referenced by a SQLite backup."""
+        found = {}
+        for path in sorted(self.root.glob("bundles/*.tar.gz")):
+            if len(found) == len(missing):
+                break
+            verified, manifest = set(), None
+            with tarfile.open(path, "r|gz") as bundle:
+                for member in bundle:
+                    if member.name == "manifest.json" and member.isfile():
+                        manifest = json.load(bundle.extractfile(member))
+                        continue
+                    digest = member.name.removesuffix(".json")
+                    row = missing.get(digest)
+                    if (row and digest not in found and member.name == digest + ".json" and
+                            member.isfile() and member.size == row["bytes"]):
+                        with bundle.extractfile(member) as stream:
+                            if hashlib.file_digest(stream, "sha256").hexdigest() == digest:
+                                verified.add(digest)
+            if manifest and manifest.get("version") == 1:
+                archive = path.relative_to(self.root).as_posix()
+                for item in manifest["submissions"]:
+                    digest = item["sha256"]
+                    if digest in verified and all(item[k] == missing[digest][k] for k in ("run_id", "bytes", "status")):
+                        found[digest] = archive
+        return found
 
     @contextmanager
     def maintenance_lock(self):
@@ -104,6 +155,9 @@ class RawArchive:
         self.ensure_directory(folder)
         target = folder / (day + "-" + uuid.uuid4().hex[:12] + ".tar.gz")
         temporary = target.with_suffix(target.suffix + ".partial")
+        # Reserve room for the temporary bundle before replacing any loose copies.
+        if shutil.disk_usage(folder).free < sum(row["bytes"] for row in rows) + 1024**2:
+            raise CapacityError("raw_archive_workspace_capacity_reached")
         manifest = [{key: row[key] for key in ("sha256", "bytes", "run_id", "status", "received", "source")}
                     for row in rows]
         try:

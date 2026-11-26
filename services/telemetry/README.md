@@ -12,6 +12,8 @@ python services/telemetry/app.py
 
 服务监听回环地址。GET /healthz 提供健康检查。页面及读取 API 要求 X-Observatory-Access 请求头与 READ_KEY 一致。部署反向代理负责注入读取头及页面访问控制。
 
+交互读取、巡检、统计和上传各有独立并发额度。请求额度满时返回 503 和 `Retry-After`，限频继续使用 429。巡检请求发送 `X-Observatory-Client: error-watch`。回环 `GET /healthz?metrics=1` 提供报错容量和按请求类型汇总的状态、运行数、耗时及写锁等待，输出使用固定类别。只读监控从回环接口取容量，无需直接打开 SQLite。
+
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | POST | /api/upload | 原生 RunHistory JSON，8 MiB 上限 |
@@ -35,9 +37,15 @@ python services/telemetry/app.py
 
 ```powershell
 python services/telemetry/app.py --backup <database-backup>
+python services/telemetry/app.py --backup-set <new-backup-directory>
+python services/telemetry/app.py --restore-backup-set <backup-directory> <new-restore-directory>
 python services/telemetry/app.py --rebuild
 python services/telemetry/app.py --archive-raw
 ```
+
+成套备份包含 SQLite、其索引引用的原始文件以及 SHA256 清单。恢复命令写入新目录并校验数据库、文件完整性及索引覆盖。旧 SQLite 备份使用独立副本和原归档目录，执行 `--repair-raw-index` 可从 tar.gz 清单重建缺失的文件定位。只有全部缺失成员通过校验才提交更新。
+
+原始归档以 `RAW_SUBMISSIONS_LIMIT_BYTES` 限制在线原始文件与归档文件占用，缺省 4 GiB。归档压缩会释放额度，备份空间另计。`--archive-status` 可核对历史原始字节、在线占用、剩余量及孤立或缺失文件数。
 
 对局支持原有筛选，以及 core_version、game_target、source_mod、language。`GET /api/stats` 的 `language_distribution` 返回 `language`、`runs`、`share`，`language_total_runs` 为分母；按当前服务端筛选与统计样本计算，每个上报对局计一次，多人席位不重复计数，旧数据计入 `unknown`。语言属于上传端；同一多人局沿用现有对局去重，统计首个成功接收载荷的语言。语言字段不参与对局身份与错误指纹。报错支持原有筛选，以及 core_version、game_target、source_mod。SQL 值使用参数绑定，页面动态字段转义，CSV 保留公式前缀防护。
 
@@ -112,6 +120,8 @@ python services/telemetry/app.py --prune-errors
 `stored_groups`、`stored_reports` 和容量限制统计活动类别及完整报告。`retired_groups`、`receipt_reports` 单独统计已淘汰摘要和重试凭据。历史摘要与去重状态继续计入数据库实际大小。默认列表只列活动类别。指纹详情返回 `data_state=retired`、`retired_at` 和 `retention_reason`，页面显示“正文已淘汰”。
 
 巡检使用 `GET /api/errors?inventory=1`，读取活动和已淘汰指纹的轻量清单。每页最多 500 项，下一页携带 `after=<next>` 与首屏 `revision`。有效上传或清理改变清单后返回 `inventory_changed`，采集器重新读取完整分页。历史指纹缺失、计数倒退、访问失败及分页不完整均不能推进成功基线。详情采集可合并同指纹的较新计数和淘汰状态，完整性边界以已通过校验的清单修订号为准。修订号之后才出现的新指纹留给下一次巡检，服务端对其保守保留。
+
+固定快照从 `inventory=1&snapshot=start` 获取。后续页带回返回的 `snapshot`、`revision` 和 `after`。快照有效期最长五分钟，跨页一致，过期返回 409 并从首屏重新开始。未要求快照的读取仍沿用修订号校验。Core 的巡检采集器支持两种分页和旧版普通列表。
 
 ### 空间回收
 

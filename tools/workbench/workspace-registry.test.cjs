@@ -33,6 +33,62 @@ test('keeps original Junna data and versions; independently persists Mod edits, 
   assert.deepEqual(s.registry.get().get({collection:'cards',id:'J01'}),before);
   assert.throws(()=>s.registry.get('../junna'),{code:'NOT_FOUND'});
 });
+
+test('workbench backup restores assets, revision and idempotent receipts', async t => {
+  const s = setup(t);
+  const {createBackup, verifyBackup} = require('./deploy/backup.cjs');
+  const assetDirectory = path.join(s.directory, 'assets');
+  const store = s.registry.get('junna');
+  const input = {requestId:crypto.randomUUID(), clientId:'fixture', label:'backup', changes:[],
+    assets:{fixture:'data:image/png;base64,' + Buffer.from('fixture').toString('base64')}};
+  await store.commit(input);
+  const backup = path.join(s.directory, 'backup');
+  await createBackup({stateDirectory:s.directory, assetDirectory}, backup);
+  const restored = await verifyBackup(backup);
+  assert.equal(restored.databases['state.sqlite'].revision, 14);
+  assert.equal(Object.keys(restored.assets).length, 1);
+  const verified = createRegistry({stateDirectory:backup, assetDirectory:path.join(backup, 'assets')});
+  assert.equal((await verified.get().commit(input)).replayed, true);
+  assert.equal(verified.get().assets(['fixture'], true).fixture, input.assets.fixture);
+  verified.close();
+});
+
+test('workbench snapshot retention preserves the current and previous revisions', {skip:process.platform === 'win32'}, async t => {
+  const s = setup(t);
+  const store = s.registry.get('junna');
+  const {createPublisher} = require('./deploy/publish-readonly.cjs');
+  const web = path.join(s.directory, 'web');
+  const templates = path.join(s.directory, 'templates');
+  for (const mod of mods) {
+    const directory = mod.id === 'junna' ? templates : path.join(templates, 'mods', mod.id);
+    fs.mkdirSync(directory, {recursive:true});
+    fs.writeFileSync(path.join(directory, 'public-template.html'), '<p>Fixture</p>');
+  }
+  let now = Date.now();
+  const publisher = createPublisher({stateDirectory:s.directory, web, templateDirectory:templates, now:() => now});
+  try {
+    assert.equal(publisher.publish(), true);
+    const first = fs.realpathSync(path.join(web, 'current'));
+    for (let i = 1; i <= 2; i++) {
+      const entry = store.get({collection:'cards', id:'J01'});
+      await store.commit({requestId:crypto.randomUUID(), clientId:'fixture', label:'publish',
+        changes:[{collection:'cards', uid:entry.uid, expectedVersion:entry.version, updates:{name:'revision ' + i}}]});
+      assert.equal(publisher.publish(), false);
+      now += 1000;
+      assert.equal(publisher.publish(), true);
+    }
+    const live = fs.realpathSync(path.join(web,'current'));
+    const previous = fs.realpathSync(path.join(web,'previous'));
+    assert.notEqual(live, previous);
+    assert.equal(fs.existsSync(first), false);
+    assert.equal(fs.readdirSync(path.join(web,'releases')).length, 2);
+    for (const directory of [live, previous]) {
+      assert.equal(JSON.parse(fs.readFileSync(path.join(directory,'workspaces.json'), 'utf8')).mods.length, 4);
+    }
+  } finally {
+    publisher.close();
+  }
+});
 test('real MCP routes and explicit modId select the same workspace; legacy calls keep Junna',async t=>{
   const s=setup(t),token=crypto.randomBytes(32).toString('hex');
   // Bind an OS-assigned loopback port, then pass the resolved port to host validation.

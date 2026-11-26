@@ -1,7 +1,12 @@
 """Transactional error lifecycle and conservative, fingerprint-based review policy."""
 import hashlib
+import gzip
 import json
 import os
+import re
+import secrets
+import tempfile
+import threading
 import time
 
 DAY = 86400
@@ -62,7 +67,6 @@ def sync_policy(store, policy, now=None):
             or not 0 < generated <= now + 300 or not max(now, generated) < expires <= generated + 3 * DAY
             or not isinstance(groups, dict) or not groups):
         raise ValueError('invalid_or_stale_retention_policy')
-    import re
     for fingerprint, entry in groups.items():
         if (not re.fullmatch('[0-9a-f]{64}', fingerprint) or not isinstance(entry, dict)
                 or set(entry) != {'status', 'closed_at'} or entry['status'] not in {'ordinary', 'ignored', 'protected', 'closed'}
@@ -124,7 +128,11 @@ def prune(store, dry_run=True, now=None, ordinary_days=None, ignored_days=None):
               'failure_scope': 'none'}
     with store.connect() as db:
         # Same writer lock as upload and policy synchronization, including candidate selection.
-        db.execute('BEGIN' if dry_run else 'BEGIN IMMEDIATE')
+        if dry_run:
+            db.execute('BEGIN')
+        else:
+            store.begin_write(db, 'error_retention')
+            result['writer_wait_ms'] = store.write_wait['error_retention']['max_ms']
         meta = db.execute('SELECT * FROM error_retention_meta').fetchone()
         result['policy_generated_at'] = meta['generated_at']
         result['policy_valid_until'] = meta['valid_until']
@@ -194,9 +202,24 @@ def prune(store, dry_run=True, now=None, ordinary_days=None, ignored_days=None):
     return result
 
 
+INVENTORY_ROWS = """SELECT id,build,mod_version,platform,source,message,first_seen,last_seen,occurrences,
+    last_activity,retired_at,retention_reason,
+    (SELECT COUNT(*) FROM error_sessions s WHERE s.group_id=g.id) AS sessions FROM error_groups g"""
+
+
+def inventory_counts(db):
+    total, active = db.execute('SELECT COUNT(*),COUNT(CASE WHEN retired_at=0 THEN 1 END) FROM error_groups').fetchone()
+    return {'total': total, 'active_groups': active, 'retired_groups': total - active,
+            'active_reports': db.execute('SELECT COUNT(*) FROM error_reports').fetchone()[0],
+            'receipt_reports': db.execute('SELECT COUNT(*) FROM error_receipts').fetchone()[0]}
+
+
+def inventory_items(rows):
+    return [dict(row) | {'data_state': 'retired' if row['retired_at'] else 'active'} for row in rows]
+
+
 def inventory(store, query):
     cursor = query.get('after', [''])[0]
-    import re
     if cursor and not re.fullmatch('[0-9a-f]{64}', cursor):
         raise ValueError('invalid_inventory_cursor')
     with store.connect() as db:
@@ -205,15 +228,88 @@ def inventory(store, query):
         expected = query.get('revision', [str(current)])[0]
         if str(current) != expected:
             raise ValueError('inventory_changed')
-        rows = db.execute("""SELECT id,build,mod_version,platform,source,message,first_seen,last_seen,occurrences,
-            last_activity,retired_at,retention_reason,
-            (SELECT COUNT(*) FROM error_sessions s WHERE s.group_id=g.id) AS sessions
-            FROM error_groups g WHERE id>? ORDER BY id LIMIT 501""", (cursor,)).fetchall()
-        total = db.execute('SELECT COUNT(*) FROM error_groups').fetchone()[0]
-        active = db.execute('SELECT COUNT(*) FROM error_groups WHERE retired_at=0').fetchone()[0]
-        reports = db.execute('SELECT COUNT(*) FROM error_reports').fetchone()[0]
-        receipts = db.execute('SELECT COUNT(*) FROM error_receipts').fetchone()[0]
-    items = [dict(row) | {'data_state': 'retired' if row['retired_at'] else 'active'} for row in rows[:500]]
-    return {'schema_version': 1, 'revision': current, 'items': items, 'total': total,
-            'active_groups': active, 'retired_groups': total - active, 'active_reports': reports,
-            'receipt_reports': receipts, 'next': items[-1]['id'] if len(rows) > 500 else None}
+        rows = db.execute(INVENTORY_ROWS + ' WHERE id>? ORDER BY id LIMIT 501', (cursor,)).fetchall()
+        counts = inventory_counts(db)
+    items = inventory_items(rows[:500])
+    return {'schema_version': 1, 'revision': current, 'items': items,
+            'next': items[-1]['id'] if len(rows) > 500 else None} | counts
+
+
+class InventoryUnavailable(ValueError):
+    pass
+
+
+class InventorySnapshots:
+    """Page files for a stable revision, without pinning the live WAL between requests."""
+
+    def __init__(self, store, ttl=300, limit=32 * 1024**2):
+        self.store, self.ttl, self.limit = store, ttl, limit
+        self.lock = threading.Lock()
+        self.snapshots = {}
+
+    def page(self, query):
+        token = query.get('snapshot', ['start'])[0]
+        cursor = query.get('after', [''])[0]
+        with self.lock:
+            now = time.monotonic()
+            for key, (expires, stream, _, _) in list(self.snapshots.items()):
+                if expires <= now:
+                    stream.close()
+                    del self.snapshots[key]
+            if token == 'start':
+                if cursor:
+                    raise ValueError('invalid_inventory_cursor')
+                token = self.create()
+            if token not in self.snapshots:
+                raise InventoryUnavailable('inventory_snapshot_expired')
+            expires, stream, pages, metadata = self.snapshots[token]
+            expected = query.get('revision', [str(metadata['revision'])])[0]
+            if expected != str(metadata['revision']):
+                raise ValueError('inventory_changed')
+            if cursor not in pages:
+                raise ValueError('invalid_inventory_cursor')
+            offset, length, following = pages[cursor]
+            stream.seek(offset)
+            items = json.loads(gzip.decompress(stream.read(length)))
+            return metadata | {'schema_version': 1, 'items': items, 'next': following,
+                               'snapshot': token, 'snapshot_ttl_seconds': max(0, int(expires - now))}
+
+    def create(self):
+        with self.store.connect() as db:
+            db.execute('BEGIN')
+            current = revision(db)
+            for key, (_, _, _, metadata) in self.snapshots.items():
+                if metadata['revision'] == current:
+                    return key
+            if len(self.snapshots) >= 2:
+                raise InventoryUnavailable('inventory_snapshot_capacity')
+            metadata = {'revision': current} | inventory_counts(db)
+            stream = tempfile.TemporaryFile(dir=self.store.path.parent)
+            try:
+                pages, cursor = {}, ''
+                result = db.execute(INVENTORY_ROWS + ' ORDER BY id')
+                rows = result.fetchmany(500)
+                while True:
+                    following = result.fetchmany(500)
+                    next_cursor = rows[-1]['id'] if following else None
+                    content = gzip.compress(json.dumps(inventory_items(rows), separators=(',', ':')).encode(), compresslevel=1)
+                    offset = stream.tell()
+                    if offset + len(content) > self.limit:
+                        raise InventoryUnavailable('inventory_snapshot_too_large')
+                    stream.write(content)
+                    pages[cursor] = (offset, len(content), next_cursor)
+                    if not following:
+                        break
+                    cursor, rows = next_cursor, following
+            except BaseException:
+                stream.close()
+                raise
+            token = secrets.token_hex(16)
+            self.snapshots[token] = (time.monotonic() + self.ttl, stream, pages, metadata)
+            return token
+
+    def close(self):
+        with self.lock:
+            for _, stream, _, _ in self.snapshots.values():
+                stream.close()
+            self.snapshots.clear()

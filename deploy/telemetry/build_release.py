@@ -29,7 +29,7 @@ def build(output):
         shutil.copy2(root / "services/telemetry" / name, output / name)
     shutil.copytree(root / "web/telemetry", output / "web")
     stamp_web_assets(output / "web")
-    for name in ("install.py", "domain_config.py"):
+    for name in ("install.py", "install_support.py", "domain_config.py"):
         shutil.copy2(root / "deploy/telemetry" / name, output / name)
     print("Release assembled")
 

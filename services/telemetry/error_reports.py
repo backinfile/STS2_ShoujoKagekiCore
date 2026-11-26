@@ -137,6 +137,9 @@ class ErrorLimiter:
 class ErrorStore:
     def __init__(self, store):
         self.store = store
+        self.snapshots = retention.InventorySnapshots(store)
+        self.filter_lock = threading.Lock()
+        self.filter_cache = None
         with store.connect() as db:
             exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='error_groups'").fetchone()
             columns = {row[1] for row in db.execute("PRAGMA table_info(error_groups)")} if exists else set()
@@ -148,7 +151,7 @@ class ErrorStore:
         if legacy:
             store.backup(store.path.parent / "backups" / ("before-error-compression-" + str(time.time_ns()) + ".sqlite3"))
         with store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            store.begin_write(db, "error_initialize")
             db.execute("""CREATE TABLE IF NOT EXISTS error_groups (
                 id TEXT PRIMARY KEY, build TEXT NOT NULL, mod_version TEXT NOT NULL,
                 platform TEXT NOT NULL, source TEXT NOT NULL, message TEXT NOT NULL, stack TEXT NOT NULL,
@@ -200,7 +203,7 @@ class ErrorStore:
         item = validate(data)
         now = int(time.time())
         with self.store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            self.store.begin_write(db, "error_upload")
             old = db.execute("SELECT * FROM error_reports WHERE id=?", (item["report_id"],)).fetchone()
             receipt = db.execute("SELECT * FROM error_receipts WHERE id=?", (item["report_id"],)).fetchone()
             if old and (old["session"] != item["session_id"] or old["group_id"] != item["fingerprint"] or old["first_seen"] != item["first_seen"]):
@@ -249,7 +252,10 @@ class ErrorStore:
     def listing(self, query):
         if query.get("inventory", ["0"])[0] == "1":
             try:
-                return retention.inventory(self.store, query)
+                result = self.snapshots.page(query) if "snapshot" in query else retention.inventory(self.store, query)
+                return result | {"group_limit": MAX_GROUPS, "report_limit": MAX_REPORTS}
+            except retention.InventoryUnavailable:
+                raise
             except ValueError as exc:
                 raise InvalidError(str(exc)) from exc
         from_groups = " FROM error_groups LEFT JOIN error_environments AS env ON env.key=error_groups.environment_id"
@@ -298,15 +304,7 @@ class ErrorStore:
             rows = db.execute("SELECT id,build,mod_version,platform,source,message,first_seen,last_seen,occurrences," + environment_column +
                               "(SELECT COUNT(*) FROM error_sessions WHERE group_id=error_groups.id) AS sessions " +
                               from_groups + where + " ORDER BY " + order + " LIMIT 20 OFFSET ?", values + [(page - 1) * 20]).fetchall()
-            builds = [row[0] for row in db.execute("SELECT DISTINCT build FROM error_groups ORDER BY build")]
-            versions = [row[0] for row in db.execute("SELECT DISTINCT mod_version FROM error_groups ORDER BY mod_version")]
-            core_versions = [row[0] for row in db.execute(
-                "SELECT DISTINCT json_extract(metadata, '$.core_telemetry.core_version') AS version "
-                "FROM error_environments WHERE version IS NOT NULL ORDER BY version")]
-            source_mods = [row[0] for row in db.execute(
-                "SELECT json_extract(mod.value, '$.id') AS id FROM error_environments, json_each(metadata, '$.mods') AS mod "
-                "UNION SELECT json_extract(mod.value, '$.id') AS id FROM error_environments, "
-                "json_each(metadata, '$.core_telemetry.source_mods') AS mod ORDER BY id")]
+            builds, versions, core_versions, source_mods = self.filters(db)
             stored_groups = db.execute("SELECT COUNT(*) FROM error_groups WHERE retired_at=0").fetchone()[0]
             stored = db.execute("SELECT COUNT(*) FROM error_reports").fetchone()[0]
             retired = db.execute("SELECT COUNT(*) FROM error_groups WHERE retired_at>0").fetchone()[0]
@@ -324,6 +322,25 @@ class ErrorStore:
                 "pages": max(1, (total + 19) // 20), "builds": builds, "mod_versions": versions,
                 "stored_reports": stored, "stored_groups": stored_groups, "retired_groups": retired, "receipt_reports": receipts, "report_limit": MAX_REPORTS, "group_limit": MAX_GROUPS,
                 "verification": "unverified_client", "core_versions": core_versions, "source_mods": source_mods}
+
+    def filters(self, db):
+        key = retention.revision(db)
+        with self.filter_lock:
+            if self.filter_cache and self.filter_cache[0] == key:
+                return self.filter_cache[1]
+        builds = [row[0] for row in db.execute("SELECT DISTINCT build FROM error_groups ORDER BY build")]
+        versions = [row[0] for row in db.execute("SELECT DISTINCT mod_version FROM error_groups ORDER BY mod_version")]
+        core_versions = [row[0] for row in db.execute(
+            "SELECT DISTINCT json_extract(metadata, '$.core_telemetry.core_version') AS version "
+            "FROM error_environments WHERE version IS NOT NULL ORDER BY version")]
+        source_mods = [row[0] for row in db.execute(
+            "SELECT json_extract(mod.value, '$.id') AS id FROM error_environments, json_each(metadata, '$.mods') AS mod "
+            "UNION SELECT json_extract(mod.value, '$.id') AS id FROM error_environments, "
+            "json_each(metadata, '$.core_telemetry.source_mods') AS mod ORDER BY id")]
+        filters = (builds, versions, core_versions, source_mods)
+        with self.filter_lock:
+            self.filter_cache = (key, filters)
+        return filters
 
     def detail(self, fingerprint):
         with self.store.connect() as db:

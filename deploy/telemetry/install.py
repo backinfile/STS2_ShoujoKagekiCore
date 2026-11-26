@@ -8,8 +8,9 @@ import pwd
 import re
 import secrets
 import subprocess
-import sys
+import time
 from domain_config import resolve_origins
+from install_support import ReleaseTransaction, database_backup, rollback_database, verify_endpoints, wait_for_collector
 from urllib.parse import urlsplit
 
 ROOT = Path("/opt/karen-observatory")
@@ -47,7 +48,6 @@ log_file.touch(exist_ok=True)
 log_file.chmod(0o640)
 os.chown(log_file, account.pw_uid, account.pw_gid)
 access_file = CONFIG / "access.json"
-access_before = access_file.read_bytes() if access_file.exists() else None
 if access_file.exists():
     access = json.loads(access_file.read_text())
 else:
@@ -68,16 +68,11 @@ if not all((upload_certificate / name).is_file() for name in ("fullchain.pem", "
     raise SystemExit("Provision the upload hostname certificate as karen-telemetry-upload before installing")
 access["page_url"] = page_origin + access["page_path"]
 access["upload_url"] = upload_origin + access["upload_path"]
-access_file.write_text(json.dumps(access, indent=2) + "\n")
-access_file.chmod(0o600)
 hashed = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=access["password"] + "\n",
                         text=True, capture_output=True, check=True).stdout.strip()
 password_file = CONFIG / "htpasswd"
-password_file.write_text(access["username"] + ":" + hashed + "\n")
-password_file.chmod(0o640)
-os.chown(password_file, 0, grp.getgrnam("www-data").gr_gid)
 environment = CONFIG / "service.env"
-limits = {"ERROR_MAX_GROUPS": 20000, "ERROR_MAX_REPORTS": 250000, "ERROR_RETENTION_DAYS": 7, "ERROR_IGNORED_RETENTION_DAYS": 3}
+limits = {"RAW_SUBMISSIONS_LIMIT_BYTES": 4 * 1024**3, "ERROR_MAX_GROUPS": 20000, "ERROR_MAX_REPORTS": 250000, "ERROR_RETENTION_DAYS": 7, "ERROR_IGNORED_RETENTION_DAYS": 3}
 if environment.exists():
     for line in environment.read_text().splitlines():
         key, _, value = line.partition("=")
@@ -93,21 +88,14 @@ if not 1 <= limits["ERROR_MAX_GROUPS"] <= 100000 or not 1 <= limits["ERROR_MAX_R
 if any(not 1 <= limits[key] <= 3650 for key in ("ERROR_RETENTION_DAYS", "ERROR_IGNORED_RETENTION_DAYS")):
     raise SystemExit("Error retention days must be 1..3650")
 
-environment.write_text(f"DATABASE_PATH={DATA}/history.sqlite3\nPORT=42767\n"
+environment_text = (f"DATABASE_PATH={DATA}/history.sqlite3\nPORT=42767\n"
                        f"RAW_SUBMISSIONS_PATH={DATA}/raw-submissions\n"
+                       f"TELEMETRY_INGEST_PAUSE_FILE={DATA}/ingest-paused\n"
                        f"READ_KEY={access['read_key']}\n"
                        f"TELEMETRY_WEB_ROOT={ROOT}/current/web\n"
                        + "".join(f"{key}={value}\n" for key, value in limits.items()))
-environment.chmod(0o640)
-os.chown(environment, 0, account.pw_gid)
 
 current = ROOT / "current"
-previous = current.resolve() if current.exists() else None
-staging = ROOT / "current.next"
-if staging.is_symlink():
-    staging.unlink()
-staging.symlink_to(release, target_is_directory=True)
-staging.replace(current)
 service = f"""[Unit]
 Description=Karen run history collector and observatory
 After=network.target
@@ -139,7 +127,6 @@ LimitNOFILE=256
 [Install]
 WantedBy=multi-user.target
 """
-Path("/etc/systemd/system/karen-observatory.service").write_text(service)
 headers = """add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "no-referrer" always;
     add_header X-Robots-Tag "noindex, nofollow" always;
@@ -163,6 +150,8 @@ location ^~ {access['page_path']} {{
     proxy_set_header X-Karen-Client-IP $karen_client_ip;
     proxy_http_version 1.1;
     proxy_pass_header Cache-Control;
+    proxy_set_header X-Observatory-Client $http_x_observatory_client;
+    proxy_intercept_errors off;
     proxy_read_timeout 30s;
     access_log off;
     {headers}
@@ -260,69 +249,43 @@ server {{
 files = {Path("/etc/nginx/conf.d/karen-observatory-upload.conf"): upload_server,
          Path("/etc/nginx/karen-services.d/karen-observatory.conf"): locations,
          Path("/etc/nginx/karen-services-http.d/karen-observatory.conf"): zones}
-old = {p: p.read_text() if p.exists() else None for p in files}
-try:
-    for path, value in files.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value)
-        path.chmod(0o600)  # nginx master reads includes as root
-    subprocess.run(["nginx", "-t"], check=True)
-    subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", "karen-observatory.service"], check=True)
-    subprocess.run(["systemctl", "restart", "karen-observatory.service"], check=True)
-    import time
-    from urllib.request import urlopen
-    for attempt in range(120):
-        try:
-            with urlopen("http://127.0.0.1:42767/healthz", timeout=2) as response:
-                assert response.status == 200
-            break
-        except Exception:
-            if attempt == 119:
-                raise
-            time.sleep(.5)
-    subprocess.run(["systemctl", "reload", "nginx"], check=True)
-except Exception:
-    if access_before is None:
-        access_file.unlink(missing_ok=True)
-    else:
-        access_file.write_bytes(access_before)
-    for path, value in old.items():
-        if value is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.write_text(value)
-    if previous:
-        current.unlink()
-        current.symlink_to(previous, target_is_directory=True)
-        subprocess.run(["systemctl", "restart", "karen-observatory.service"])
-    raise
+nginx_files = files
+files = {Path("/etc/systemd/system/karen-observatory.service"): service}
 
 backup_script = ROOT / "backup.py"
-backup_script.write_text('''from datetime import datetime, timezone
+files[backup_script] = '''from datetime import datetime, timezone
 from pathlib import Path
-import os, subprocess
+import re, shutil, subprocess
 root=Path('/var/lib/karen-observatory/backups')
 root.mkdir(mode=0o700,exist_ok=True)
-os.environ['DATABASE_PATH']='/var/lib/karen-observatory/history.sqlite3'
-target=root/('history-'+datetime.now(timezone.utc).strftime('%Y%m%d')+'.sqlite3')
-subprocess.run(['/usr/bin/python3','/opt/karen-observatory/current/app.py','--backup',str(target)],check=True)
-for old in sorted(root.glob('history-????????.sqlite3'))[:-7]: old.unlink()
-''')
-Path("/etc/systemd/system/karen-observatory-backup.service").write_text(f"""[Unit]
-Description=Online SQLite backup for Karen Observatory
+target=root/('history-set-'+datetime.now(timezone.utc).strftime('%Y%m%d'))
+if not target.exists():
+    subprocess.run(['/usr/bin/python3','/opt/karen-observatory/current/app.py','--backup-set',str(target)],check=True)
+backups=[p for p in root.iterdir() if re.fullmatch('history-set-[0-9]{8}',p.name)
+         and (p/'manifest.json').is_file() and not p.is_symlink()]
+backups.extend(p for p in root.iterdir() if re.fullmatch('history-[0-9]{8}[.]sqlite3',p.name)
+               and p.is_file() and not p.is_symlink())
+for old in sorted(backups,key=lambda p:(p.stem[-8:],p.is_dir()))[:-7]:
+    if old.is_dir() and old.resolve().parent==root.resolve():
+        shutil.rmtree(old)
+    elif old.is_file():
+        old.unlink()
+'''
+files[Path("/etc/systemd/system/karen-observatory-backup.service")] = f"""[Unit]
+Description=Consistent SQLite and raw submissions backup for Karen Observatory
 [Service]
 Type=oneshot
 User={USER}
 Group={USER}
 UMask=0077
+EnvironmentFile={CONFIG}/service.env
 ExecStart=/usr/bin/python3 {backup_script}
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths={DATA}
 ProtectHome=true
-""")
-Path("/etc/systemd/system/karen-observatory-backup.timer").write_text("""[Unit]
+"""
+files[Path("/etc/systemd/system/karen-observatory-backup.timer")] = """[Unit]
 Description=Daily Karen history backup
 [Timer]
 OnCalendar=*-*-* 04:30:00 UTC
@@ -330,10 +293,8 @@ Persistent=true
 RandomizedDelaySec=15m
 [Install]
 WantedBy=timers.target
-""")
-subprocess.run(["systemctl", "daemon-reload"], check=True)
-subprocess.run(["systemctl", "enable", "--now", "karen-observatory-backup.timer"], check=True)
-Path("/etc/systemd/system/karen-observatory-raw-archive.service").write_text(f"""[Unit]
+"""
+files[Path("/etc/systemd/system/karen-observatory-raw-archive.service")] = f"""[Unit]
 Description=Verify and compress closed UTC days of original Karen JSON submissions
 [Service]
 Type=oneshot
@@ -351,8 +312,8 @@ ProtectHome=true
 ReadWritePaths={DATA}
 MemoryMax=128M
 CPUQuota=25%
-""")
-Path("/etc/systemd/system/karen-observatory-raw-archive.timer").write_text("""[Unit]
+"""
+files[Path("/etc/systemd/system/karen-observatory-raw-archive.timer")] = """[Unit]
 Description=Daily compression of original Karen JSON submissions
 [Timer]
 OnCalendar=*-*-* 00:15:00 UTC
@@ -360,10 +321,8 @@ Persistent=true
 RandomizedDelaySec=10m
 [Install]
 WantedBy=timers.target
-""")
-subprocess.run(["systemctl", "daemon-reload"], check=True)
-subprocess.run(["systemctl", "enable", "--now", "karen-observatory-raw-archive.timer"], check=True)
-Path("/etc/logrotate.d/karen-observatory").write_text(f"""{LOGS}/service.log {{
+"""
+files[Path("/etc/logrotate.d/karen-observatory")] = f"""{LOGS}/service.log {{
     daily
     rotate 7
     maxsize 1M
@@ -373,49 +332,62 @@ Path("/etc/logrotate.d/karen-observatory").write_text(f"""{LOGS}/service.log {{
     copytruncate
     su {USER} {USER}
 }}
-""")
+"""
 monitor = ROOT / "monitor.py"
-monitor.write_text('''import json,shutil,time
+files[monitor] = '''import json,os,shutil,time
 from pathlib import Path
 from urllib.request import urlopen
 data=Path('/var/lib/karen-observatory')
-with urlopen('http://127.0.0.1:42767/healthz',timeout=5) as response:
-    if json.load(response).get('status')!='ok': raise SystemExit('health endpoint failed')
+with urlopen('http://127.0.0.1:42767/healthz?metrics=1',timeout=5) as response:
+    metrics=json.load(response)
+    if metrics.get('status')!='ok': raise SystemExit('health endpoint failed')
+    print(json.dumps(metrics,separators=(',',':')))
 if shutil.disk_usage(data).free<2*1024**3: raise SystemExit('disk free below 2GiB')
 if (data/'history.sqlite3').stat().st_size>900*1024**2: raise SystemExit('database above 900MiB warning threshold')
-backups=list((data/'backups').glob('history-????????.sqlite3'))
+backups=list((data/'backups').glob('history-set-????????/manifest.json'))
 if not backups or time.time()-max(p.stat().st_mtime for p in backups)>48*3600: raise SystemExit('backup missing or older than 48 hours')
 pending=list((data/'raw-submissions'/'pending').glob('*/*.json'))
-if pending and time.time()-min(p.stat().st_mtime for p in pending)>48*3600: raise SystemExit('raw JSON archive backlog older than 48 hours')
-''')
-Path("/etc/systemd/system/karen-observatory-monitor.service").write_text(f"""[Unit]
+try:
+    sizes=[p.stat() for p in pending]
+except FileNotFoundError:
+    sizes=[]  # a concurrent archive pass removed a loose file
+if sizes and time.time()-min(p.st_mtime for p in sizes)>48*3600: raise SystemExit('raw JSON archive backlog older than 48 hours')
+total=sum(p.st_size for p in sizes)
+for bundle in (data/'raw-submissions'/'bundles').glob('*.tar.gz'):
+    try: total+=bundle.stat().st_size
+    except FileNotFoundError: pass
+groups=metrics['capacity']['active_error_groups']
+reports=metrics['capacity']['error_reports']
+print(json.dumps({'archive_bytes':total,'active_error_groups':groups,'error_reports':reports}))
+if (total>=int(os.environ['RAW_SUBMISSIONS_LIMIT_BYTES'])*.85 or
+        groups>=int(os.environ['ERROR_MAX_GROUPS'])*.85 or
+        reports>=int(os.environ['ERROR_MAX_REPORTS'])*.85):
+    print('Observatory storage nearing configured capacity',flush=True)
+'''
+files[Path("/etc/systemd/system/karen-observatory-monitor.service")] = f"""[Unit]
 Description=Karen collector health, disk and backup monitor
 [Service]
 Type=oneshot
 User={USER}
 Group={USER}
+EnvironmentFile={CONFIG}/service.env
 ExecStart=/usr/bin/python3 {monitor}
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 MemoryMax=48M
 CPUQuota=10%
-""")
-Path("/etc/systemd/system/karen-observatory-monitor.timer").write_text("""[Unit]
+"""
+files[Path("/etc/systemd/system/karen-observatory-monitor.timer")] = """[Unit]
 Description=Check Karen collector every minute
 [Timer]
 OnBootSec=2m
 OnUnitActiveSec=1m
 [Install]
 WantedBy=timers.target
-""")
-subprocess.run(["systemctl", "daemon-reload"], check=True)
-subprocess.run(["systemctl", "start", "karen-observatory-backup.service"], check=True)
-subprocess.run(["systemctl", "enable", "--now", "karen-observatory-monitor.timer"], check=True)
-subprocess.run(["systemctl", "start", "karen-observatory-monitor.service"], check=True)
-print("Installed isolated collector, protected random routes and daily backups. Access data remains in /etc/karen-observatory/access.json")
+"""
 
-Path("/etc/systemd/system/karen-observatory-error-retention.service").write_text(f"""[Unit]
+files[Path("/etc/systemd/system/karen-observatory-error-retention.service")] = f"""[Unit]
 Description=Retire inactive error bodies and unreferenced environments
 After=karen-observatory.service
 [Service]
@@ -435,8 +407,8 @@ ReadWritePaths={DATA}
 MemoryMax=256M
 CPUQuota=25%
 TimeoutStartSec=10min
-""")
-Path("/etc/systemd/system/karen-observatory-error-retention.timer").write_text("""[Unit]
+"""
+files[Path("/etc/systemd/system/karen-observatory-error-retention.timer")] = """[Unit]
 Description=Daily error retention after the morning review
 [Timer]
 OnCalendar=*-*-* 02:30:00 UTC
@@ -444,6 +416,72 @@ Persistent=true
 RandomizedDelaySec=10m
 [Install]
 WantedBy=timers.target
-""")
-subprocess.run(["systemctl", "daemon-reload"], check=True)
-subprocess.run(["systemctl", "enable", "--now", "karen-observatory-error-retention.timer"], check=True)
+"""
+
+if limits["RAW_SUBMISSIONS_LIMIT_BYTES"] <= 0:
+    raise SystemExit("Raw submissions limit must be positive")
+
+collector = "karen-observatory.service"
+timer_names = ("backup", "raw-archive", "monitor", "error-retention")
+timers = [f"karen-observatory-{name}.timer" for name in timer_names]
+pause = DATA / "ingest-paused"
+if pause.exists():
+    raise SystemExit("An existing ingest pause must be resolved before installing")
+with ReleaseTransaction([*nginx_files, *files, access_file, password_file, environment, current, pause],
+                        [collector, *timers], collector) as deploy:
+    for path, content in nginx_files.items():
+        deploy.write(path, content, mode=0o600)
+    subprocess.run(["nginx", "-t"], check=True)
+
+    for name, timer in zip(timer_names, timers):
+        if deploy.old_units[timer][0]:
+            deploy.unit("stop", timer)
+        job = f"karen-observatory-{name}.service"
+        state = deploy.systemctl("show", "-p", "ActiveState", "--value", job, capture_output=True, text=True)
+        if state.stdout.strip() in ("active", "activating", "deactivating"):
+            raise RuntimeError(f"Wait for the current {name} maintenance job to finish")
+
+    if deploy.old_units[collector][0]:
+        deploy.unit("stop", collector)
+    backups = CONFIG / "pre-release"
+    backups.mkdir(mode=0o700, exist_ok=True)
+    database = DATA / "history.sqlite3"
+    release_time = time.time_ns()
+    saved = backups / f"history-{release_time}.sqlite3"
+    database_backup(database, saved)
+
+    deploy.write(pause, "Candidate release readiness check\n", mode=0o644)
+    deploy.write(access_file, json.dumps(access, indent=2) + "\n", mode=0o600)
+    deploy.write(password_file, access["username"] + ":" + hashed + "\n", mode=0o640,
+                 owner=(0, grp.getgrnam("www-data").gr_gid))
+    deploy.write(environment, environment_text, mode=0o640, owner=(0, account.pw_gid))
+    for path, content in files.items():
+        deploy.write(path, content)
+    deploy.switch(current, release)
+    deploy.reload_units()
+    deploy.unit("enable", collector)
+    deploy.rollback_database = lambda: rollback_database(database, saved, backups / f"failed-{release_time}.sqlite3")
+    # Apply data migrations as the service identity before starting the
+    # request-serving unit with its steady-state cgroup resource limits.
+    migration_environment = os.environ | dict(line.split("=", 1) for line in environment_text.splitlines())
+    migration_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    print("Applying collector database migrations before service start", flush=True)
+    subprocess.run(["runuser", "-u", USER, "--", "/usr/bin/python3", str(release / "app.py"), "--migrate-only"],
+                   check=True, env=migration_environment)
+    deploy.unit("start", collector)
+    wait_for_collector()
+    verify_endpoints(access)
+    deploy.reload_nginx()
+    verify_endpoints(access, origin=True)
+    deploy.systemctl("start", "karen-observatory-backup.service", check=True)
+    deploy.systemctl("start", "karen-observatory-monitor.service", check=True)
+    for timer in timers[:-1]:
+        deploy.unit("enable", timer)
+    # Once timers can mutate the active database and archive, preserve all writes.
+    deploy.rollback_database = None
+    for timer in timers[:-1]:
+        deploy.unit("start", timer)
+    if deploy.old_units[timers[-1]][0]:
+        deploy.unit("start", timers[-1])
+    pause.unlink()
+print("Installed and verified collector, protected routes and backups. Error retention uses its existing timer state.")

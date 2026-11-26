@@ -6,11 +6,15 @@
 python deploy/telemetry/build_release.py --output <new-release-directory>
 ```
 
-输出含 app.py、error_reports.py、protocol.py、raw_archive.py、read_index.py、web 和 install.py。输出目录必须尚不存在。
+输出包含遥测服务、Web 资源、安装器及其配置回退模块。输出目录必须尚不存在。
 
 发布方将目录作为既有服务的一个新 release 保存，在部署主机运行 install.py。已有 access.json 中的页面路径、上传路径、读取凭据、数据库与服务身份继续使用。首次安装通过 --public-origin 或 TELEMETRY_PUBLIC_ORIGIN 提供 HTTPS 域名，之后从既有 upload_url 恢复。安装脚本保留反向代理路径映射、页面控制、限流、SQLite 备份、原始归档及监控服务。
 
 真实 access.json、service.env、客户端 endpoint 和生产数据独立保管。仓库只维护配置格式及生成程序。部署前备份数据库与归档，记录发行提交。回退选择同时识别旧、新请求格式的服务发行目录。
+
+安装器先验证 Nginx 配置，再暂停维护定时器和现有采集进程，保存迁移前的 SQLite。安装器以服务身份单独执行迁移，再启动受常态资源配额限制的采集服务。候选启动期间上传返回可重试的 503。安装器从回环和 HTTPS 源站核对页面、列表及清单，再确认备份和监控。候选失败时恢复原链接、配置文件、服务及定时器状态。维护任务仍暂停时，安装器另存失败的数据库快照并恢复升级前版本。
+
+生产升级前用副本验证迁移、回退和代表性上传。每日备份附带原始提交文件及校验清单，按现有每日七份轮换。正式报错清理通过独立的定时器启用步骤切换。已有清理定时器沿用安装前状态。
 
 ## 上传与查看域名
 
@@ -62,9 +66,9 @@ PWA 清单及 Worker 使用相对作用域，沿用现有页面访问路径。�
 
 1. 从已确认的源码提交生成新 release，记录文件哈希。备份数据库、访问配置和当前 release 指向。
 2. 使用只读一致副本验证迁移，核对原正文、指纹、累计次数、事件时间和环境内容。保存 dry-run 输出，确认保留名单和迁移宽限期。
-3. 按现有授权流程复制 release 并执行 `install.py`。安装器为旧库生成迁移前备份，启动新服务并安装每日清理定时器。
+3. 按现有授权流程复制 release 并执行 `install.py`。安装器为旧库生成迁移前备份，启动新服务并安装每日清理定时器单元。
 4. Karen 按 `docs/error-watch-retention.md` 完成一次全分页巡检及审阅，导入指纹策略。同步先暂停清理，再原子导入。失败时保持暂停，下一次成功同步恢复。
-5. 在生产主机以服务用户执行 `app.py --prune-errors --dry-run`，核对候选、保留、预计正文及环境释放量，再按批准的上线安排启用正式执行。`systemctl start karen-observatory-error-retention.service` 可手动触发已安装的清理入口。
+5. 在生产主机以服务用户执行 `app.py --prune-errors --dry-run`，核对候选、保留、预计正文及环境释放量，再按批准的上线安排执行 `systemctl enable --now karen-observatory-error-retention.timer`。`systemctl start karen-observatory-error-retention.service` 可手动触发已安装的清理入口。
 6. 核对服务、定时器、清理日志、容量计数及下一次巡检。首次迁移后，旧记录需要经过完整宽限期才会进入候选。
 
 同步策略通过现有 SSH 管理连接及本地 CLI 完成，公开上传与只读 API 路由保持现有权限。Karen `tools/error_watch.py sync --ssh-host <production-ssh-config>` 使用服务身份导入，SSH 身份需要能够调用 `runuser`。

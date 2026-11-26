@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from contextlib import contextmanager, closing
+from functools import wraps
 import gzip
 import hashlib
 import hmac
@@ -14,6 +16,8 @@ from pathlib import Path
 import re
 import socket
 import sqlite3
+import shutil
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -21,8 +25,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from protocol import core_context, language_code
-from raw_archive import RawArchive, utc_day
+from raw_archive import CapacityError, RawArchive, utc_day
 import read_index
+from error_retention import InventoryUnavailable
 from error_reports import ErrorStore, ErrorLimiter, InvalidError, MAX_BODY as MAX_ERROR_BODY
 
 ROOT = Path(__file__).resolve().parent
@@ -36,13 +41,12 @@ CATALOG = json.loads((WEB / "catalog.json").read_text(encoding="utf-8"))
 LOG = logging.getLogger("karen-telemetry")
 FACTS_VERSION = 4
 EARLY_ABANDON_FLOOR = 5
+OVERLOAD_RETRY = 2
+ROUTE_LIMITS = {"health": 1, "page": 3, "review": 1, "statistics": 2, "ingest": 2}
+LATENCY_BUCKETS_MS = (25, 100, 250, 500, 1000, 2000, 5000, 10000)
 
 
 class Invalid(ValueError):
-    pass
-
-
-class CapacityError(OSError):
     pass
 
 
@@ -309,6 +313,9 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.raw = RawArchive(raw_root or os.environ.get("RAW_SUBMISSIONS_PATH") or self.path.parent / "raw-submissions")
         self.raw_limit = int(raw_limit if raw_limit is not None else os.environ.get("RAW_SUBMISSIONS_LIMIT_BYTES", 4 * 1024**3))
+        self.filters = OrderedDict()
+        self.filters_lock = threading.Lock()
+        self.write_wait = {}
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("""CREATE TABLE IF NOT EXISTS runs (
@@ -339,16 +346,25 @@ class Store:
         finally:
             db.close()
 
+    def begin_write(self, db, operation):
+        start = time.monotonic()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+        finally:
+            ms = round((time.monotonic() - start) * 1000)
+            with self.filters_lock:
+                row = self.write_wait.setdefault(operation, {"count": 0, "total_ms": 0, "max_ms": 0})
+                row["count"] += 1
+                row["total_ms"] += ms
+                row["max_ms"] = max(row["max_ms"], ms)
+
     def preserve_submission(self, db, body, rid, status, received, source="request"):
         digest = hashlib.sha256(body).hexdigest()
         existing = db.execute("SELECT * FROM submissions WHERE sha256=?", (digest,)).fetchone()
         if existing:
             self.raw.read(existing)
             return
-        used = db.execute("SELECT COALESCE(SUM(bytes),0) FROM submissions").fetchone()[0]
-        if used + len(body) > self.raw_limit:
-            raise CapacityError("raw_submission_capacity_reached")
-        self.raw.write(digest, received, body)
+        self.raw.write(digest, received, body, limit=self.raw_limit)
         db.execute("INSERT INTO submissions(sha256,run_id,status,received,bytes,source) VALUES (?,?,?,?,?,?)",
                    (digest, rid, status, received, len(body), source))
 
@@ -359,10 +375,11 @@ class Store:
         original_body = original_body if original_body is not None else raw
         digest = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False,
                                          separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        compressed = gzip.compress(raw)
         rid = facts["id"]
         received = int(time.time())
         with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            self.begin_write(db, "run_upload")
             old = db.execute("SELECT digest FROM runs WHERE id=?", (rid,)).fetchone()
             if old:
                 if not hmac.compare_digest(old["digest"], digest):
@@ -377,9 +394,11 @@ class Store:
                 return 507, {"error": "storage_capacity_reached"}
             self.preserve_submission(db, original_body, rid, 201, received, source)
             db.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                       (rid, digest, gzip.compress(raw), dumps(facts), received,
+                       (rid, digest, compressed, dumps(facts), received,
                         facts["start_time"], facts["build"], facts["ascension"], facts["mode"],
                         facts["player_count"], facts["outcome"], facts["floor"]))
+        with self.filters_lock:
+            self.filters.clear()
         return 201, {"status": "ok", "run_id": rid,
                      "quality": {"missing_was_picked": facts["missing_picked"]}}
 
@@ -456,17 +475,32 @@ class Store:
 
     def run_filters(self, query):
         where, values = self.where(query)
+        # Reuse the same rolling cohort across pages and views. The cache also
+        # expires when another process writes to the database.
+        key = (where, tuple(values[1:] if where.startswith(" WHERE received>=?") else values),
+               query.get("days", ["7"])[0])
+        with self.filters_lock:
+            cached = self.filters.get(key)
+            if cached and time.monotonic() - cached[0] < 5:
+                self.filters.move_to_end(key)
+                return cached[1]
         cohort = "SELECT id FROM runs" + where
         with self.connect() as db:
             builds = [r[0] for r in db.execute("SELECT DISTINCT build FROM runs ORDER BY build DESC")]
             characters = db.execute("SELECT DISTINCT character FROM stats_characters WHERE run_id IN (" + cohort + ")", values)
             sources = db.execute("SELECT DISTINCT source_mod FROM stats_sources WHERE run_id IN (" + cohort + ")", values)
             meta = db.execute("SELECT DISTINCT language,core_version,game_target FROM stats_runs WHERE run_id IN (" + cohort + ")", values).fetchall()
-            return {"builds": builds, "characters": sorted(r[0] for r in characters),
+            filters = {"builds": builds, "characters": sorted(r[0] for r in characters),
                     "source_mods": sorted(r[0] for r in sources),
                     "languages": sorted({r["language"] for r in meta}),
                     "core_versions": sorted({r["core_version"] for r in meta if r["core_version"] is not None}),
                     "game_targets": sorted({r["game_target"] for r in meta if r["game_target"] is not None})}
+        with self.filters_lock:
+            self.filters[key] = (time.monotonic(), filters)
+            self.filters.move_to_end(key)
+            if len(self.filters) > 32:
+                self.filters.popitem(last=False)
+        return filters
 
     def character_stats(self, query):
         where, values = self.where(query, include_sample=True)
@@ -606,6 +640,7 @@ class Store:
                 for day, entries in batches:
                     archive = self.raw.pack(day, entries)
                     with self.connect() as db:
+                        self.begin_write(db, "raw_archive")
                         db.executemany("UPDATE submissions SET archive=? WHERE sha256=? AND archive IS NULL",
                                        [(archive, row["sha256"]) for row in entries])
                     for row in entries:
@@ -664,6 +699,109 @@ class Store:
         with self.connect() as db, closing(sqlite3.connect(target)) as out:
             db.backup(out)
 
+    def archive_status(self):
+        with self.connect() as db:
+            logical = db.execute("SELECT COALESCE(SUM(bytes),0) FROM submissions").fetchone()[0]
+            references = set()
+            for row in db.execute("SELECT sha256,received,archive FROM submissions"):
+                references.add(self.raw.referenced_file(row))
+            groups, active = db.execute(
+                "SELECT COUNT(*),COUNT(CASE WHEN retired_at=0 THEN 1 END) FROM error_groups").fetchone()
+            reports = db.execute("SELECT COUNT(*) FROM error_reports").fetchone()[0]
+        stored = self.raw.disk_bytes()
+        return {"raw_logical_bytes": logical, "raw_stored_bytes": stored, "raw_limit_bytes": self.raw_limit,
+                "raw_remaining_bytes": max(0, self.raw_limit - stored),
+                "raw_unreferenced_files": sum(path not in references for path in self.raw.files()),
+                "raw_missing_files": sum(not path.is_file() for path in references),
+                "error_groups": groups, "active_error_groups": active, "error_reports": reports}
+
+    def repair_raw_index(self):
+        with self.raw.maintenance_lock():
+            with self.connect() as db:
+                missing = {row["sha256"]: dict(row) for row in db.execute("SELECT * FROM submissions")
+                           if not self.raw.referenced_file(row).is_file()}
+            locations = self.raw.archive_locations(missing)
+            if locations.keys() != missing.keys():
+                raise OSError(f"raw_recovery_missing_members:{len(missing) - len(locations)}")
+            with self.connect() as db:
+                self.begin_write(db, "raw_recovery")
+                db.executemany("UPDATE submissions SET archive=? WHERE sha256=? AND archive IS ?",
+                               [(archive, digest, missing[digest]["archive"]) for digest, archive in locations.items()])
+        return len(locations)
+
+    def backup_set(self, destination):
+        target = Path(destination)
+        if target.exists():
+            raise ValueError("backup_set_already_exists")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with self.raw.maintenance_lock(), tempfile.TemporaryDirectory(dir=target.parent) as directory:
+            staged = Path(directory) / "backup"
+            staged.mkdir(mode=0o700)
+            database = staged / "history.sqlite3"
+            self.backup(database)
+            with closing(sqlite3.connect(database)) as db:
+                db.row_factory = sqlite3.Row
+                if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise OSError("backup_database_integrity_failed")
+                paths = {self.raw.referenced_file(row) for row in db.execute("SELECT * FROM submissions")}
+            manifest = {"history.sqlite3": file_sha256(database)}
+            for source in sorted(paths):
+                relative = Path("raw-submissions") / source.relative_to(self.raw.root)
+                output = staged / relative
+                output.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, output)
+                except OSError:
+                    shutil.copy2(source, output)
+                manifest[relative.as_posix()] = file_sha256(output)
+            (staged / "raw-submissions").mkdir(exist_ok=True)
+            with (staged / "manifest.json").open("w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "files": manifest}, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            RawArchive.sync_directory(staged)
+            staged.rename(target)
+            RawArchive.sync_directory(target.parent)
+
+
+def file_sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def restore_backup_set(source, destination):
+    source = Path(source)
+    target = Path(destination)
+    if target.exists():
+        raise ValueError("restore_destination_already_exists")
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("version") != 1 or "history.sqlite3" not in manifest["files"]:
+        raise ValueError("invalid_backup_manifest")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=target.parent) as directory:
+        staged = Path(directory) / "restore"
+        (staged / "raw-submissions").mkdir(mode=0o700, parents=True)
+        for relative, digest in manifest["files"].items():
+            if relative != "history.sqlite3" and not re.fullmatch(
+                    r"raw-submissions/(?:pending/[0-9-]+/[a-f0-9]{64}\.json|bundles/[a-zA-Z0-9-]+\.tar\.gz)", relative):
+                raise ValueError("invalid_backup_file")
+            output = staged / relative
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / relative, output)
+            if file_sha256(output) != digest:
+                raise OSError("backup_checksum_mismatch")
+        with closing(sqlite3.connect(staged / "history.sqlite3")) as db:
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise OSError("backup_database_integrity_failed")
+            db.row_factory = sqlite3.Row
+            archive = RawArchive(staged / "raw-submissions")
+            expected = {"history.sqlite3"}
+            for row in db.execute("SELECT sha256,received,archive FROM submissions"):
+                expected.add(archive.referenced_file(row).relative_to(staged).as_posix())
+            if expected != manifest["files"].keys():
+                raise OSError("backup_archive_manifest_incomplete")
+        staged.rename(target)
+
 
 def safe_display(value):
     # JavaScript must not round 64-bit Steam/player identifiers.
@@ -681,14 +819,31 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 32
 
     def __init__(self, address, store, read_key):
-        self.slots = threading.BoundedSemaphore(8)
+        self.slots = threading.BoundedSemaphore(16)
+        self.routes = {route: threading.BoundedSemaphore(limit) for route, limit in ROUTE_LIMITS.items()}
+        self.metrics_lock = threading.Lock()
+        self.metrics = {route: {"limit": limit, "running": 0, "status": {}, "total_ms": 0, "max_ms": 0,
+                                "latency_ms": dict.fromkeys((*map(str, LATENCY_BUCKETS_MS), "over"), 0)}
+                        for route, limit in ROUTE_LIMITS.items()}
+        self.connection_rejections = 0
+        pause_file = os.environ.get("TELEMETRY_INGEST_PAUSE_FILE")
+        self.ingest_pause_file = Path(pause_file) if pause_file else None
         self.store, self.read_key = store, read_key
         self.error_limiter = ErrorLimiter()
         super().__init__(address, Handler)
 
     def process_request(self, request, address):
         if not self.slots.acquire(blocking=False):
-            request.close()
+            with self.metrics_lock:
+                self.connection_rejections += 1
+            try:
+                request.setblocking(False)
+                request.sendall(
+                    f"HTTP/1.1 503 Service Unavailable\r\nRetry-After: {OVERLOAD_RETRY}\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n".encode("ascii"))
+            except OSError:
+                pass
+            self.shutdown_request(request)
             return
         try:
             super().process_request(request, address)
@@ -701,6 +856,59 @@ class Server(ThreadingHTTPServer):
             super().process_request_thread(request, address)
         finally:
             self.slots.release()
+
+    def request_metrics(self):
+        with self.metrics_lock, self.store.filters_lock:
+            return {"routes": {key: row | {"status": dict(row["status"]), "latency_ms": dict(row["latency_ms"])}
+                               for key, row in self.metrics.items()},
+                    "connection_rejections": self.connection_rejections,
+                    "write_wait": {key: dict(row) for key, row in self.store.write_wait.items()}}
+
+
+def admit(handler):
+    @wraps(handler)
+    def handle(self):
+        path, _, query = self.path.partition("?")
+        if self.command == "POST":
+            route = "ingest"
+        elif path == "/healthz":
+            route = "health"
+        elif (path == "/api/errors" and parse_qs(query).get("inventory") == ["1"]) or (
+                path.startswith("/api/errors") and self.headers.get("X-Observatory-Client") == "error-watch"):
+            route = "review"
+        elif path in ("/api/stats", "/api/character-stats", "/api/language-stats") or path.endswith("/raw"):
+            route = "statistics"
+        else:
+            route = "page"
+        server = self.server
+        slot = server.routes[route]
+        admitted = slot.acquire(blocking=False)
+        metrics = server.metrics[route]
+        start = time.monotonic()
+        self.response_status = None
+        if admitted:
+            with server.metrics_lock:
+                metrics["running"] += 1
+        try:
+            if admitted:
+                handler(self)
+            else:
+                self.respond(503, {"error": "service_busy"})
+        finally:
+            duration = round((time.monotonic() - start) * 1000)
+            with server.metrics_lock:
+                code = str(self.response_status or 0)
+                metrics["status"][code] = metrics["status"].get(code, 0) + 1
+                if admitted:
+                    bucket = next((str(limit) for limit in LATENCY_BUCKETS_MS if duration <= limit), "over")
+                    metrics["latency_ms"][bucket] += 1
+                metrics["total_ms"] += duration
+                metrics["max_ms"] = max(metrics["max_ms"], duration)
+                if admitted:
+                    metrics["running"] -= 1
+            if admitted:
+                slot.release()
+    return handle
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -716,6 +924,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def respond(self, status, value, content_type="application/json; charset=utf-8", download=False, cache_control="no-store", etag=None):
+        self.response_status = status
         raw = value if isinstance(value, bytes) else dumps(value).encode()
         encoding = None
         if status == 200 and not download and len(raw) >= 1024 and content_type.startswith(("text/", "application/json", "application/manifest+json")):
@@ -737,6 +946,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         if status == 429:
             self.send_header("Retry-After", "60")
+        elif status == 503:
+            self.send_header("Retry-After", str(OVERLOAD_RETRY))
         if download:
             self.send_header("Content-Disposition", 'attachment; filename="run-history.json"')
         self.end_headers()
@@ -747,9 +958,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    @admit
     def do_GET(self):
         try:
             self.get()
+        except InventoryUnavailable as exc:
+            status = 409 if str(exc) == "inventory_snapshot_expired" else 503
+            self.respond(status, {"error": str(exc)})
         except (Invalid, InvalidError) as exc:
             self.respond(400, {"error": str(exc)})
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
@@ -764,6 +979,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             with self.server.store.connect() as db:
                 db.execute("SELECT 1").fetchone()
+                if query.get("metrics") == ["1"]:
+                    capacity = {
+                        "active_error_groups": db.execute("SELECT COUNT(*) FROM error_groups WHERE retired_at=0").fetchone()[0],
+                        "error_reports": db.execute("SELECT COUNT(*) FROM error_reports").fetchone()[0],
+                    }
+                    return self.respond(200, {"status": "ok", "capacity": capacity} | self.server.request_metrics())
             return self.respond(200, {"status": "ok"})
         if not hmac.compare_digest(self.headers.get("X-Observatory-Access", ""), self.server.read_key):
             return self.respond(404, {"error": "not_found"})
@@ -806,11 +1027,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, file.read_bytes(), mime, cache_control=cache, etag=etag)
         self.respond(404, {"error": "not_found"})
 
+    @admit
     def do_POST(self):
         try:
             path = urlsplit(self.path).path
             if path not in ("/api/upload", "/api/upload-session", "/api/errors"):
                 return self.respond(404, {"error": "not_found"})
+            if self.server.ingest_pause_file and self.server.ingest_pause_file.exists():
+                return self.respond(503, {"error": "release_in_progress"})
             session = path == "/api/upload-session"
             errors = path == "/api/errors"
             if errors:
@@ -859,12 +1083,31 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     operations.add_argument("--sync-error-policy", type=Path)
     operations.add_argument("--suspend-error-retention", action="store_true")
+    operations.add_argument("--archive-status", action="store_true")
+    operations.add_argument("--repair-raw-index", action="store_true")
+    operations.add_argument("--backup-set", type=Path)
+    operations.add_argument("--restore-backup-set", nargs=2, metavar=("BACKUP", "DESTINATION"))
+    operations.add_argument("--migrate-only", action="store_true")
     args = parser.parse_args()
-    if (args.prune_errors or args.sync_error_policy or args.suspend_error_retention) and (args.backup or args.archive_raw or args.rebuild):
-        parser.error("Error maintenance requires a separate invocation")
+    if (args.prune_errors or args.sync_error_policy or args.suspend_error_retention or args.archive_status
+            or args.repair_raw_index or args.backup_set or args.restore_backup_set or args.migrate_only) and (
+            args.backup or args.archive_raw or args.rebuild):
+        parser.error("Maintenance requires a separate invocation")
     if args.dry_run and not args.prune_errors:
         parser.error("--dry-run requires --prune-errors")
+    if args.restore_backup_set:
+        restore_backup_set(*args.restore_backup_set)
+        return
     store = Store(os.environ.get("DATABASE_PATH", str(ROOT / "data/history.sqlite3")))
+    if args.backup_set:
+        store.backup_set(args.backup_set)
+        return
+    if args.repair_raw_index:
+        print(dumps({"recovered": store.repair_raw_index()}))
+        return
+    if args.archive_status:
+        print(dumps(store.archive_status()))
+        return
     if args.suspend_error_retention:
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -885,12 +1128,17 @@ def main():
         print(dumps(result))
         return
     if args.rebuild or (not args.backup and not args.archive_raw and store.needs_rebuild()):
-        backup = args.backup or str(store.path.parent / "backups" / ("before-facts-v3-" + str(time.time_ns()) + ".sqlite3"))
+        backup = args.backup or str(store.path.parent / "backups" / f"before-facts-v{FACTS_VERSION}-{time.time_ns()}.sqlite3")
         LOG.warning("derived_history_rebuild count=%s", store.rebuild(backup))
         if args.rebuild:
             return
+    if args.migrate_only:
+        print(dumps({"status": "migrated", "facts_version": FACTS_VERSION}))
+        return
     if args.archive_raw:
-        LOG.warning("raw_submissions_archived count=%s", store.archive_submissions())
+        packed = store.archive_submissions()
+        wait = store.write_wait.get("raw_archive", {}).get("max_ms", 0)
+        LOG.warning("raw_submissions_archived count=%s max_writer_wait_ms=%s", packed, wait)
         return
     if args.backup:
         store.backup(args.backup)
@@ -902,7 +1150,10 @@ def main():
     port = int(os.environ.get("PORT", "42767"))
     with Server(("127.0.0.1", port), store, read_key) as server:
         LOG.info("collector_started port=%s", port)
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        finally:
+            store.errors.snapshots.close()
 
 
 if __name__ == "__main__":
